@@ -188,6 +188,66 @@ def test_submit_ruling_overrides_events_and_revision_flow(client):
     assert revs[1]["trigger"] == "adjudication"
 
 
+def test_ruling_idempotent_retry_defaults_and_equivalent_timezone(client):
+    """同内容重试：说明省略（与显式空串等价）、等价时区表示均稳定命中原裁定。"""
+    sid = _settled_shift(client)
+    # 提交时省略 note（缺省值 ""）
+    body = {
+        "ruling_no": "R-DEF",
+        "start": "2026-10-01T10:30:00+08:00",
+        "end": "2026-10-01T11:30:00+08:00",
+        "reason": "failure",
+    }
+    r = client.post(f"/shifts/{sid}/adjudications", json=body)
+    assert r.status_code == 201
+    assert r.json()["idempotent"] is False
+
+    # 显式空串 note + 等价 UTC 时区表示（10:30+08:00 == 02:30Z）→ 同内容幂等
+    retry = {
+        "ruling_no": "R-DEF",
+        "start": "2026-10-01T02:30:00Z",
+        "end": "2026-10-01T03:30:00Z",
+        "reason": "failure",
+        "note": "",
+    }
+    r = client.post(f"/shifts/{sid}/adjudications", json=retry)
+    assert r.status_code == 200
+    assert r.json()["idempotent"] is True
+    assert r.json()["revision"] is None
+
+    # 说明真实不同 → 保留冲突
+    r = client.post(
+        f"/shifts/{sid}/adjudications", json={**retry, "note": "补充说明"}
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "RULING_CONFLICT"
+
+    # 幂等重试未产生新修订：仍只有结算与本次裁定两条
+    revs = client.get(f"/shifts/{sid}/revisions").json()
+    assert [x["revision"] for x in revs] == [1, 2]
+
+    # 同名单号在另一班次是不同记录（不跨班次复用编号）
+    r = client.post(
+        "/shifts",
+        json={
+            "device_id": "CNC-01",
+            "start": "2026-10-02T08:00:00+08:00",
+            "end": "2026-10-02T16:00:00+08:00",
+        },
+    )
+    sid2 = r.json()["id"]
+    client.post(f"/shifts/{sid2}/settle")
+    body2 = {
+        "ruling_no": "R-DEF",
+        "start": "2026-10-02T10:30:00+08:00",
+        "end": "2026-10-02T11:30:00+08:00",
+        "reason": "failure",
+    }
+    r = client.post(f"/shifts/{sid2}/adjudications", json=body2)
+    assert r.status_code == 201
+    assert r.json()["idempotent"] is False
+
+
 def test_ruling_without_minute_change_creates_no_revision(client):
     sid = _settled_shift(client)
     # 12:00-13:00 本来就是故障 60 分钟：裁定同原因，分钟数不变 → 无修订、无变更

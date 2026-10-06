@@ -230,6 +230,48 @@ def test_closing_idempotent_same_input_and_conflict(client):
     assert r3.json()["detail"]["code"] == "CLOSING_CONFLICT"
 
 
+def test_closing_idempotent_retry_with_equivalent_timezone(client):
+    """同输入重试：期间用等价时区表示（同一时刻的 Z 与 +08:00）稳定命中原结账。"""
+    client.post("/devices", json=DEVICE)
+    s1 = _shift(client, "01")
+    _event(client, "PLC-9", 1, "10:00:00", "11:00:00", "failure")
+    client.post(f"/shifts/{s1}/settle")
+    _publish_rates(client, [_rate_entry("failure", "00:00:00", "23:59:00", "1")], 1)
+
+    body = {
+        "device_id": "CNC-01",
+        "closing_no": "LC-TZ",
+        "start": "2026-10-01T00:00:00+08:00",
+        "end": "2026-10-02T00:00:00+08:00",
+        "seq": 1,
+        "rate_version": 1,
+    }
+    r1 = _close(client, body)
+    assert r1.status_code == 201
+    first_id = r1.json()["id"]
+
+    # 同一时刻的 UTC 表示（00:00+08:00 == 前一天 16:00Z）→ 同输入，幂等命中
+    retry = {
+        **body,
+        "start": "2026-09-30T16:00:00Z",
+        "end": "2026-10-01T16:00:00Z",
+    }
+    r2 = _close(client, retry)
+    assert r2.status_code == 200
+    assert r2.json()["idempotent"] is True
+    assert r2.json()["id"] == first_id
+    assert r2.json()["items"] == r1.json()["items"]
+
+    # 时刻真实改变（同一时区表示）→ 仍是 CLOSING_CONFLICT
+    r3 = _close(client, {**retry, "end": "2026-10-01T17:00:00Z"})
+    assert r3.status_code == 409
+    assert r3.json()["detail"]["code"] == "CLOSING_CONFLICT"
+
+    # 未重复写入：设备仍只有一张结账
+    listing = client.get("/devices/CNC-01/loss-closings").json()
+    assert [c["id"] for c in listing] == [first_id]
+
+
 def test_empty_closing_when_no_matching_shift(client):
     client.post("/devices", json=DEVICE)
     # 只有未结算班次

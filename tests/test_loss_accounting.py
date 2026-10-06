@@ -215,6 +215,56 @@ def test_get_unknown_rate_version_404(client):
     assert r.json()["detail"]["code"] == "RATE_VERSION_NOT_FOUND"
 
 
+def test_publish_normalizes_entry_order_timezone_amount_and_default_note(client):
+    """费率发布的内容规范化：行换序、等价时区、等价金额写法与省略说明，
+    落库的版本内容一致（版本号仍按发布次序递增，不做内容幂等）。"""
+    client.post("/devices", json=DEVICE)
+    entries = [
+        _entry("failure", "10:00:00", "11:00:00", "1.5"),
+        _entry("maintenance", "09:00:00", "10:00:00", "2"),
+        _entry("failure", "09:00:00", "10:00:00", "1"),
+    ]
+    r1 = _publish(client, entries, note="").json()
+
+    # 等价提交：行换序 + 等价 UTC 时区 + 等价金额写法（"1.5"=="1.50"、"1"=="1.00"）
+    # + 省略 note（与显式空串等价）→ 落库内容逐项一致
+    equivalent = [
+        {
+            "reason": "failure",
+            "start": "2026-10-01T01:00:00Z",
+            "end": "2026-10-01T02:00:00Z",
+            "amount_per_minute": "1.00",
+        },
+        {
+            "reason": "failure",
+            "start": "2026-10-01T02:00:00Z",
+            "end": "2026-10-01T03:00:00Z",
+            "amount_per_minute": "1.50",
+        },
+        {
+            "reason": "maintenance",
+            "start": "2026-10-01T01:00:00Z",
+            "end": "2026-10-01T02:00:00Z",
+            "amount_per_minute": "2.000000",
+        },
+    ]
+    r2 = client.post("/devices/CNC-01/rate-versions", json={"entries": equivalent})
+    assert r2.status_code == 201, r2.text
+    v2 = r2.json()
+    assert v2["version"] == r1["version"] + 1  # 发布不幂等：版本号连续递增
+    assert v2["note"] == r1["note"] == ""
+
+    # 两版本的规范化费率表逐行一致（entry_no 按 起点/原因/终点 稳定编号）
+    t1 = client.get(f"/devices/CNC-01/rate-versions/{r1['version']}").json()
+    t2 = client.get(f"/devices/CNC-01/rate-versions/{v2['version']}").json()
+    assert t1["entries"] == t2["entries"]
+    assert [(e["reason"], e["amount_per_minute"]) for e in t1["entries"]] == [
+        ("failure", "1"),
+        ("maintenance", "2"),
+        ("failure", "1.5"),
+    ]
+
+
 def test_concurrent_publishes_get_contiguous_versions(client):
     client.post("/devices", json=DEVICE)
     barrier = threading.Barrier(4)

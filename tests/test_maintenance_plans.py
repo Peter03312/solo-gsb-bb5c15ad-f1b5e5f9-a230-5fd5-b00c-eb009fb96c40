@@ -174,6 +174,48 @@ def test_same_no_different_period_conflict(client):
     assert r.json()["detail"]["code"] == "MAINTENANCE_PLAN_CONFLICT"
 
 
+def test_concurrent_same_no_same_content_single_plan(client):
+    """同单号同内容并发提交：只固化一张计划单，其余幂等返回，不重复写入。"""
+    import threading
+
+    client.post("/devices", json=DEVICE)
+    body = _plan_body(
+        [_iv(1, "11:00:00", "12:00:00"), _iv(1, "10:00:00", "11:00:00")],
+        plan_no="MP-CONC",
+    )
+    barrier = threading.Barrier(4)
+    statuses: list[int] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            r = _submit(client, body)
+            with lock:
+                statuses.append(r.status_code)
+                assert r.status_code in (200, 201), r.text
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert statuses.count(201) == 1
+    assert statuses.count(200) == 3
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT COUNT(*) FROM maintenance_plans WHERE plan_no='MP-CONC'")
+        ).scalar() == 1
+    # 并发同内容提交后，同单号异内容仍判冲突（指纹比较不受竞争影响）
+    r = _submit(client, _plan_body([_iv(1, "10:00:00", "11:00:00")], plan_no="MP-CONC"))
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "MAINTENANCE_PLAN_CONFLICT"
+
+
 def test_overlapping_period_same_device_rejected(client):
     client.post("/devices", json=DEVICE)
     assert _submit(client, _plan_body([_iv(1, "10:00:00", "11:00:00")], "MP-A")).status_code == 201

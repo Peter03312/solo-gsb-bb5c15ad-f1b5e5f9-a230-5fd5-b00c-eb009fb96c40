@@ -347,6 +347,52 @@ def test_idempotent_same_content_order_independent_and_conflict(client):
     assert got.json()["accounts"] == first["accounts"]
 
 
+def test_idempotent_retry_with_equivalent_timezone(client):
+    """同内容重试：批次窗口用等价时区表示（同一时刻的 Z 与 +08:00）稳定命中原单。"""
+    _shift_id, accounting_id = _setup_accounting(client)
+    body = {
+        "device_id": "CNC-01",
+        "allocation_no": "AL-TZ",
+        "accounting_ids": [accounting_id],
+        "batches": [_batch("B1", "10:00:00", "11:00:00")],
+    }
+    first = _allocate(client, body, expect=201).json()
+
+    # 同一时刻的 UTC 表示（10:00+08:00 == 02:00Z）→ 同内容，幂等命中
+    retry = {
+        **body,
+        "batches": [
+            {
+                "batch_no": "B1",
+                "start": "2026-10-01T02:00:00Z",
+                "end": "2026-10-01T03:00:00Z",
+            }
+        ],
+    }
+    second = _allocate(client, retry, expect=200).json()
+    assert second["idempotent"] is True
+    assert second["id"] == first["id"]
+    assert second["accounts"] == first["accounts"]
+
+    # 时刻真实改变 → 仍是 ALLOCATION_CONFLICT
+    conflict = {
+        **retry,
+        "batches": [
+            {
+                "batch_no": "B1",
+                "start": "2026-10-01T02:30:00Z",
+                "end": "2026-10-01T03:00:00Z",
+            }
+        ],
+    }
+    r = _allocate(client, conflict, expect=409)
+    assert r.json()["detail"]["code"] == "ALLOCATION_CONFLICT"
+
+    # 未重复写入：设备仍只有一张分摊单
+    listing = client.get("/devices/CNC-01/loss-cost-allocations").json()
+    assert [a["id"] for a in listing] == [first["id"]]
+
+
 def test_multiple_accounts_different_shifts_in_one_order(client):
     _, acc1 = _setup_accounting(client)
     # 第二个班次（10/4，避开幂等用例占用的 10/2–10/3）：故障 09:00-10:00，

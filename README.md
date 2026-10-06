@@ -1516,6 +1516,18 @@ curl 'http://localhost:8000/maintenance-plans/MP-202610-001/check?seq=1'
 - **版本链与幂等**：`event_sources` 表保存每个 `(设备, 来源)` 的 `last_version` 与内容哈希，
   上报时 `INSERT ... ON CONFLICT DO NOTHING` + `SELECT ... FOR UPDATE` 串行化校验；
   内容哈希 = `sha256(start_utc|end_utc|reason)`。
+- **幂等写入的内容指纹**（`app/fingerprint.py`，纯标准库可独立测试）：事件、现场裁定、
+  费率发布、损失账分摊、期间结账与保养计划的同内容判定共用一套规范化规则——
+  时间戳归一 UTC（等价时区算同内容）、顺序无业务含义的列表确定性排序（账 id 去重升序、
+  批次按批次号、保养窗口按起点、费率行按起点/原因/终点）、可选说明字段省略与空串等价；
+  会改变业务含义的字段全部入指纹，差异即保留 409 冲突。指纹只做归一化比较，不替代也
+  不放宽 schema/服务层字段校验（缺时区、非整分钟、区间倒置等仍在指纹计算前被拒绝）；
+  编号作用域不随规范化扩大：裁定单号班次内唯一，分摊/结账/计划单号全局唯一，
+  指纹含设备号或蕴含设备的账引用，绝不跨设备/班次误判同内容。各写路径按
+  "业务键查既有记录 → 比对指纹 → 同内容幂等返回 / 异内容冲突"的统一模式比较，
+  唯一约束兜底并发竞争（竞争方回滚后转幂等读取或冲突）。指纹算法与既有库已固化的
+  `content_hash` 逐字节兼容（事件/裁定为竖线分隔串，其余为键排序紧凑 JSON），
+  升级不影响旧记录的同内容命中。
 - **裁定与撤销**：`manual_adjudications` 保存裁定原文与 `active/revoked` 状态（撤销留痕、
   行不删除），`(shift_id, ruling_no)` 唯一；内容哈希 = `sha256(start_utc|end_utc|reason|note)`，
   同单号同内容幂等、异内容冲突（含复用已撤销单号）。提交/撤销在**班次行 `FOR UPDATE` 锁内**
@@ -1643,6 +1655,7 @@ curl 'http://localhost:8000/maintenance-plans/MP-202610-001/check?seq=1'
 app/
   main.py         # FastAPI 路由
   services.py     # 业务逻辑：版本链、幂等、结算、更正重算
+  fingerprint.py  # 幂等写入的内容指纹：时区归一/列表排序/默认值等价的规范化与哈希（纯标准库）
   attribution.py  # 归因算法（半开区间运算，纯标准库）
   reconciliation.py # 现场-系统对账算法（裁剪/覆盖/差集，纯标准库）
   pricing.py      # 损失核算：定点金额、费率校验、按费率边界切分/逐段取整/待定价（纯标准库）
@@ -1654,6 +1667,7 @@ app/
   db.py           # 引擎、会话、建库建表（含排他约束）
   config.py       # 环境变量配置
 tests/
+  test_fingerprint.py      # 内容指纹单测（等价时区/列表换序/默认值省略/冲突保留/逐字节兼容，无外部依赖，可 python3 直接跑）
   test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退与区间明细拆段合并，无外部依赖，可 python3 直接跑）
   test_reconciliation.py # 对账算法单测（裁剪合并/覆盖差集/未对账/最大连续区间，无外部依赖，可 python3 直接跑）
   test_api.py            # API 端到端测试（需 PostgreSQL）

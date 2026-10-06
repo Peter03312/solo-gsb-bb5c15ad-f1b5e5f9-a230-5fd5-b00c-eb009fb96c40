@@ -30,6 +30,9 @@ req POST /events '{"device_id":"CNC-01","source_id":"MES-1","version":1,"start":
 echo "-- 重复提交同一事件版本，预期 200 且 idempotent=true --"
 req POST /events '{"device_id":"CNC-01","source_id":"MES-1","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"maintenance"}'
 
+echo "-- 等价时区重试同一事件版本（10:00+08:00 == 02:00Z），预期 200 且 idempotent=true --"
+req POST /events '{"device_id":"CNC-01","source_id":"MES-1","version":1,"start":"2026-10-01T02:00:00Z","end":"2026-10-01T03:00:00Z","reason":"maintenance"}'
+
 echo "-- 同版本异内容，预期 409 VERSION_CONFLICT --"
 req POST /events '{"device_id":"CNC-01","source_id":"MES-1","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"maintenance"}'
 
@@ -52,6 +55,9 @@ req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30
 
 echo "-- 同单号同内容重试：幂等 200，revision=null（无修订明确标示）--"
 req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure","note":"现场核对为传动故障"}'
+
+echo "-- 等价时区重试同一裁定（10:30+08:00 == 02:30Z）：预期 200 且 idempotent=true --"
+req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T02:30:00Z","end":"2026-10-01T03:30:00Z","reason":"failure","note":"现场核对为传动故障"}'
 
 echo "-- 同单号异内容：预期 409 RULING_CONFLICT --"
 req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"pending","note":"改判待判"}'
@@ -257,6 +263,11 @@ req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocatio
   {"batch_no":"B1001","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00"},
   {"batch_no":"B1002","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T11:30:00+08:00"}]}'
 
+echo "-- 等价时区重试同一分摊单（批次窗口改用 UTC 表示）：预期 200 幂等 --"
+req POST /devices/CNC-01/loss-cost-allocations '{"device_id":"CNC-01","allocation_no":"AL-SMOKE-001","accounting_ids":[2],"batches":[
+  {"batch_no":"B1001","start":"2026-10-01T02:00:00Z","end":"2026-10-01T03:00:00Z"},
+  {"batch_no":"B1002","start":"2026-10-01T03:00:00Z","end":"2026-10-01T03:30:00Z"}]}'
+
 echo "-- 按单号读取固化分摊；列出设备全部分摊单 --"
 req GET /loss-cost-allocations/AL-SMOKE-001
 req GET /devices/CNC-01/loss-cost-allocations
@@ -293,6 +304,12 @@ echo "-- 同单号同输入重试：预期 200 幂等，idempotent=true，账引
 req POST /devices/CNC-01/loss-closings "{
   \"device_id\":\"CNC-01\",\"closing_no\":\"LC-SMOKE-001\",
   \"start\":\"2026-10-01T00:00:00+08:00\",\"end\":\"2026-10-03T00:00:00+08:00\",
+  \"seq\":$CLOSING_SEQ,\"rate_version\":1}"
+
+echo "-- 等价时区重试同一结账（期间改用 UTC 表示）：预期 200 幂等 --"
+req POST /devices/CNC-01/loss-closings "{
+  \"device_id\":\"CNC-01\",\"closing_no\":\"LC-SMOKE-001\",
+  \"start\":\"2026-09-30T16:00:00Z\",\"end\":\"2026-10-02T16:00:00Z\",
   \"seq\":$CLOSING_SEQ,\"rate_version\":1}"
 
 echo "-- 按单号读取固化结账；列出设备全部结账 --"

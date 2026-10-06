@@ -148,6 +148,49 @@ def test_event_version_chain(client):
     assert r.json()["idempotent"] is False
 
 
+def test_event_idempotent_retry_with_equivalent_timezone(client):
+    """同内容重试：等价时区（同一时刻的 Z / +08:00 / -05:00 表示）稳定命中原记录。"""
+    _make_shift(client)
+    assert client.post("/events", json=E_MAINT).status_code == 201
+
+    # 同一时刻的 UTC 表示（10:00+08:00 == 02:00Z）→ 同内容，幂等命中
+    r = client.post(
+        "/events",
+        json={
+            **E_MAINT,
+            "start": "2026-10-01T02:00:00Z",
+            "end": "2026-10-01T03:00:00Z",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["idempotent"] is True
+    assert r.json()["recomputed"] == []
+
+    # 同一时刻的另一偏移表示（02:00Z == 前一天 21:00-05:00）→ 仍幂等
+    r = client.post(
+        "/events",
+        json={
+            **E_MAINT,
+            "start": "2026-09-30T21:00:00-05:00",
+            "end": "2026-09-30T22:00:00-05:00",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["idempotent"] is True
+
+    # 时刻真实改变（哪怕同一时区表示）→ 仍是 VERSION_CONFLICT
+    r = client.post(
+        "/events",
+        json={**E_MAINT, "end": "2026-10-01T03:30:00Z"},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+    # 等价时区重试未产生任何新数据：版本链仍停在 1，下一版本号仍为 2
+    r = client.post("/events", json={**E_MAINT, "version": 2})
+    assert r.status_code == 201
+
+
 # ---------------------------------------------------------------- 结算 / 更正 / 修订
 
 

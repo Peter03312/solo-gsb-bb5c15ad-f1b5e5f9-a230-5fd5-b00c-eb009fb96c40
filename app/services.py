@@ -14,7 +14,15 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import attribution, pricing, reconciliation, allocation, closing, maintenance
+from . import (
+    allocation,
+    attribution,
+    closing,
+    fingerprint,
+    maintenance,
+    pricing,
+    reconciliation,
+)
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -57,11 +65,6 @@ class ApiError(HTTPException):
 
 def _utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
-
-
-def _content_hash(start: datetime, end: datetime, reason: str) -> str:
-    raw = f"{start.isoformat()}|{end.isoformat()}|{reason}"
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def get_device_or_404(db: Session, device_id: str) -> Device:
@@ -326,7 +329,7 @@ def ingest_event(
     """
     get_device_or_404(db, payload.device_id)
     start, end = _utc(payload.start), _utc(payload.end)
-    digest = _content_hash(start, end, payload.reason)
+    digest = fingerprint.event_fingerprint(start, end, payload.reason)
 
     # 确保版本链游标存在并加行锁，串行化同一来源的并发上报
     db.execute(
@@ -449,7 +452,7 @@ def ingest_event_batch(
     acks: list[dict] = []
     for item in payload.events:
         start, end = _utc(item.start), _utc(item.end)
-        digest = _content_hash(start, end, item.reason)
+        digest = fingerprint.event_fingerprint(start, end, item.reason)
         exp = expected[item.source_id]
         if item.version <= exp:
             # 已存在（库中或本批已接受）的同版本：同内容可重试，异内容整批失败
@@ -761,7 +764,7 @@ def preview_event(db: Session, payload: EventIn) -> tuple[bool, list[dict], str]
     """
     get_device_or_404(db, payload.device_id)
     start, end = _utc(payload.start), _utc(payload.end)
-    digest = _content_hash(start, end, payload.reason)
+    digest = fingerprint.event_fingerprint(start, end, payload.reason)
 
     # 只读：不补建来源行、不加锁；状态竞争由确认时的逐项复核兜底
     src = db.execute(
@@ -890,7 +893,7 @@ def confirm_event(
     device_id = state["device_id"]
     get_device_or_404(db, device_id)
     start, end = state["start"], state["end"]
-    digest = _content_hash(start, end, state["reason"])
+    digest = fingerprint.event_fingerprint(start, end, state["reason"])
 
     # 与单条上报共用同一版本链行锁，串行化并发上报/确认
     db.execute(
@@ -985,11 +988,6 @@ def confirm_event(
 # ---------------------------------------------------------------- 现场人工裁定
 
 
-def _ruling_hash(start: datetime, end: datetime, reason: str, note: str) -> str:
-    raw = f"{start.isoformat()}|{end.isoformat()}|{reason}|{note}"
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def _get_locked_settled_shift(db: Session, shift_id: int) -> Shift:
     """取出班次行（FOR UPDATE 串行化该班次的所有写操作）并要求已结算。"""
     shift = db.execute(
@@ -1045,7 +1043,7 @@ def submit_adjudication(
             f"shift [{shift.start_ts.isoformat()}, {shift.end_ts.isoformat()})",
         )
     note = payload.note or ""
-    digest = _ruling_hash(start, end, payload.reason, note)
+    digest = fingerprint.ruling_fingerprint(start, end, payload.reason, note)
 
     existing = db.execute(
         select(ManualAdjudication).where(
@@ -1614,8 +1612,9 @@ def publish_rate_version(
     )
     db.add(version)
     db.flush()  # 会话 autoflush=False：先落版本行，费率行复合外键才可见
-    # entry_no 按起点（再按原因、终点）稳定排序后编号；发布内容即冻结内容
-    ordered = sorted(lines, key=lambda ln: (ln.start, ln.reason, ln.end))
+    # 费率表规范化（提交列表换序不影响落库内容）：entry_no 按
+    # （起点, 原因, 终点）稳定排序后编号；发布内容即冻结内容
+    ordered = fingerprint.canonical_rate_lines(lines)
     next_version = last_version + 1
     entries: list[RateEntry] = []
     for entry_no, line in enumerate(ordered, start=1):
@@ -1958,29 +1957,6 @@ def list_loss_accountings(
 # ------------------------------------------------ 停机损失按生产批次分摊
 
 
-def _allocation_content_hash(
-    accounting_ids: list[int], batches: list[tuple[str, datetime, datetime]]
-) -> str:
-    """规范化提交内容 → sha256（与列表顺序无关）。
-
-    账 id 去重升序；批次按批次号升序，窗口端点归一为 UTC 整分钟 ISO 串。
-    """
-    canonical_accounts = sorted(set(accounting_ids))
-    canonical_batches = sorted(
-        ((bno, _utc(s), _utc(e)) for bno, s, e in batches),
-        key=lambda b: b[0],
-    )
-    payload = {
-        "accounting_ids": canonical_accounts,
-        "batches": [
-            {"batch_no": bno, "start": s.isoformat(), "end": e.isoformat()}
-            for bno, s, e in canonical_batches
-        ],
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def allocate_loss_costs(db: Session, payload) -> tuple[
     LossCostAllocation,
     list[
@@ -2013,7 +1989,7 @@ def allocate_loss_costs(db: Session, payload) -> tuple[
         raise ApiError(422, "BATCH_WINDOW_INVALID", str(exc))
 
     accounting_ids = list(payload.accounting_ids)
-    content_hash = _allocation_content_hash(
+    content_hash = fingerprint.allocation_fingerprint(
         accounting_ids, [(b.batch_no, b.start, b.end) for b in payload.batches]
     )
 
@@ -2271,25 +2247,6 @@ def list_device_loss_cost_allocations(
 # ------------------------------------------------ 按设备期间停机损失结账
 
 
-def _closing_content_hash(
-    device_id: str,
-    start: datetime,
-    end: datetime,
-    seq: int,
-    rate_version: int,
-) -> str:
-    """规范化结账输入 → sha256（时间归一 UTC 整分钟 ISO 串）。"""
-    payload = {
-        "device_id": device_id,
-        "start": _utc(start).isoformat(),
-        "end": _utc(end).isoformat(),
-        "seq": int(seq),
-        "rate_version": int(rate_version),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def _closing_items(
     db: Session, closing_id: int
 ) -> list[
@@ -2364,7 +2321,7 @@ def close_device_loss_period(
     device = get_device_or_404(db, payload.device_id)
     win_start, win_end = _utc(payload.start), _utc(payload.end)
 
-    content_hash = _closing_content_hash(
+    content_hash = fingerprint.closing_fingerprint(
         device.id, win_start, win_end, payload.seq, payload.rate_version
     )
 
@@ -2608,29 +2565,6 @@ def list_device_loss_period_closings(
 # ------------------------------------------------ 计划保养提交与核对
 
 
-def _maintenance_plan_hash(
-    device_id: str,
-    start: datetime,
-    end: datetime,
-    windows: list[tuple[datetime, datetime]],
-) -> str:
-    """规范化计划内容 → sha256（时间归一 UTC 整分钟 ISO 串，窗口顺序无关）。"""
-    canonical_windows = sorted(
-        ((_utc(s), _utc(e)) for s, e in windows),
-        key=lambda w: (w[0], w[1]),
-    )
-    payload = {
-        "device_id": device_id,
-        "start": _utc(start).isoformat(),
-        "end": _utc(end).isoformat(),
-        "windows": [
-            {"start": s.isoformat(), "end": e.isoformat()} for s, e in canonical_windows
-        ],
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def submit_maintenance_plan(
     db: Session, payload
 ) -> tuple[MaintenancePlan, bool]:
@@ -2654,7 +2588,7 @@ def submit_maintenance_plan(
     except maintenance.MaintenancePlanError as exc:
         raise ApiError(422, "MAINTENANCE_WINDOW_INVALID", str(exc))
 
-    content_hash = _maintenance_plan_hash(
+    content_hash = fingerprint.maintenance_plan_fingerprint(
         payload.device_id, win_start, win_end, raw_windows
     )
 
