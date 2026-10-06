@@ -182,8 +182,10 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   - **同版本同原因**区间不得重叠（端点相接允许），不同原因可重叠（任一分钟只会被归因为一种
     原因，费率按 `(原因, 时间)` 选取）；费率表不能为空，任一非法整批拒绝（不留下任何行）；
   - 版本号**设备内连续递增**（服务端在设备行锁内分配）：并发发布串行、版本无缺口；
-    版本与其全部费率行**同事务原子提交**，不存在"发布了一半"的版本；发布后**不可变**
-    （只追加，后续发布只产生新版本）。
+    版本与其全部费率行**同事务原子提交**，不存在"发布了一半"的版本；发布后**不可变**。
+    同设备提交**相同费率表**（等价时区、行顺序无关、`"1"`/`"1.000000"` 等相同数值
+    写法；版本说明 `note` 不参与计价）会复用原版本（`200`，`idempotent=true`），
+    不同费率表才追加新版本（`201`，`idempotent=false`）。
 - **停机损失核算**：`POST /shifts/{id}/loss-accountings` 对已结算班次指定修订（缺省最新）
   与费率版本，基于该修订**同事务固化的归因段**与该版本的不可变费率行：
   - 固化段被该原因费率行的边界切成定价子段与间隙；定价段用**定点整数**（内部微元，
@@ -253,7 +255,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `GET` | `/changes?cursor=&limit=` | 变更同步：按全局递增游标分页读取结算/更正/裁定/撤销变更 |
 | `GET` | `/devices/{device_id}/shift-snapshots?start=&end=&seq=&limit=&cursor=` | 班次归因快照：按固定变更序号取与窗口相交、已结算班次的最后修订（首次接入/重建索引） |
 | `POST` | `/devices/{device_id}/downtime-reconciliation` | 按设备对账现场停机与系统已结算归因（固定序号、差异与未对账分钟分别给最大连续区间） |
-| `POST` | `/devices/{device_id}/rate-versions` | 原子发布设备的递增费率版本（完整费率表；非法/重叠/空表 422 整批拒绝；未知设备 404） |
+| `POST` | `/devices/{device_id}/rate-versions` | 原子发布/幂等复用设备的递增费率版本（完整费率表；非法/重叠/空表 422 整批拒绝；未知设备 404） |
 | `GET` | `/devices/{device_id}/rate-versions` | 设备费率版本列表（版本号降序，含各版本费率行数） |
 | `GET` | `/devices/{device_id}/rate-versions/{version}` | 读取某版本完整费率表（未知版本 404） |
 | `POST` | `/shifts/{id}/loss-accountings` | 按（修订, 费率版本）核算停机损失并幂等固化（首次 201 / 重复 200；待定价分钟单列） |
@@ -1006,7 +1008,9 @@ curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation -H 'Co
 | `note` | 否 | 版本说明（≤ 500 字） |
 
 版本号由服务端分配（设备内 1 起连续）；`GET .../rate-versions` 列版本，
-`GET .../rate-versions/{version}` 读完整费率表。已发布版本不可变。
+`GET .../rate-versions/{version}` 读完整费率表。已发布版本不可变；同设备相同费率表
+重试返回原版本（HTTP 200，`idempotent=true`），等价时区、费率行换序及相同金额数值
+写法都视为同内容，不同费率表才分配下一版本（HTTP 201）。
 
 ### 核算
 
@@ -1038,7 +1042,10 @@ curl -X POST http://localhost:8000/devices/CNC-01/rate-versions \
     {"reason":"failure","start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T23:59:00+08:00","amount_per_minute":"1"},
     {"reason":"maintenance","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T11:30:00+08:00","amount_per_minute":"2"}
   ]}'
-# 201 {"device_id":"CNC-01","version":1,"entry_count":6,"entries":[...按 entry_no(起点) 升序...]}
+# 201 {"device_id":"CNC-01","version":1,"entry_count":6,"idempotent":false,"entries":[...按 entry_no(起点) 升序...]}
+
+# 同费率表重试（行换序、UTC 等价时间、1.50 等金额写法等价；note 不参与计价）
+# → 200，version 仍为 1，idempotent=true，不生成重复版本；改任一费率区间/金额才会得到新版本 201
 ```
 
 > 故障五行在 10:00、10:30、11:30、12:00 端点相接，合法；把任一行改成与另一行重叠即

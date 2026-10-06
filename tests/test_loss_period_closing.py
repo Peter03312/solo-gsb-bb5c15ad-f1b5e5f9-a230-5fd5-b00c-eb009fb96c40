@@ -217,7 +217,14 @@ def test_closing_idempotent_same_input_and_conflict(client):
     first_id = r1.json()["id"]
     first_accounting = r1.json()["items"][0]["accounting_id"]
 
-    r2 = _close(client, body)
+    r2 = _close(
+        client,
+        {
+            **body,
+            "start": "2026-09-30T16:00:00Z",
+            "end": "2026-10-01T16:00:00+00:00",
+        },
+    )
     assert r2.status_code == 200
     assert r2.json()["idempotent"] is True
     assert r2.json()["id"] == first_id

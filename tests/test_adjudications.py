@@ -188,6 +188,30 @@ def test_submit_ruling_overrides_events_and_revision_flow(client):
     assert revs[1]["trigger"] == "adjudication"
 
 
+def test_ruling_timezone_and_omitted_default_note_are_idempotent(client):
+    sid = _settled_shift(client)
+    body = _ruling(
+        "R-TZ",
+        "failure",
+        "2026-10-01T02:00:00Z",
+        "2026-10-01T02:30:00Z",
+        note="",
+    )
+    r = client.post(f"/shifts/{sid}/adjudications", json=body)
+    assert r.status_code == 201, r.text
+    retry = client.post(
+        f"/shifts/{sid}/adjudications",
+        json={
+            "ruling_no": "R-TZ",
+            "reason": "failure",
+            "start": "2026-10-01T10:00:00+08:00",
+            "end": "2026-10-01T10:30:00+08:00",
+        },
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["idempotent"] is True
+
+
 def test_ruling_without_minute_change_creates_no_revision(client):
     sid = _settled_shift(client)
     # 12:00-13:00 本来就是故障 60 分钟：裁定同原因，分钟数不变 → 无修订、无变更

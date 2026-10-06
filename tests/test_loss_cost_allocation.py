@@ -283,6 +283,18 @@ def test_idempotent_same_content_order_independent_and_conflict(client):
     assert second["idempotent"] is True
     assert second["id"] == first["id"]
     assert second["accounts"] == first["accounts"]
+    # 等价 UTC 时间仍命中原单
+    utc_retry = {
+        **base,
+        "batches": [
+            {
+                "batch_no": "B1",
+                "start": "2026-10-01T02:00:00Z",
+                "end": "2026-10-01T03:00:00+00:00",
+            }
+        ],
+    }
+    assert _allocate(client, utc_retry, expect=200).json()["id"] == first["id"]
 
     # 同内容顺序无关（两账两批次）：构造另一个班次（10/5）的第二份账，
     # 用不同列表顺序提交相同集合——账 id 与批次均乱序，仍判同内容 → 200

@@ -57,6 +57,7 @@ from .schemas import (
     RateVersionDetailOut,
     RateVersionIn,
     RateVersionOut,
+    RateVersionPublishedOut,
     ReasonMinutes,
     RecomputedShift,
     ReconciledShiftRef,
@@ -107,8 +108,9 @@ app = FastAPI(
         "POST /devices/{device_id}/downtime-reconciliation 按固定变更序号对账现场"
         "停机记录与系统已结算归因（仅在已结算班次覆盖分钟比较，差异与未对账"
         "分钟分别给出最大连续区间，结果携带所用序号以便重放）；"
-        "POST /devices/{device_id}/rate-versions 按设备原子发布递增费率版本"
-        "（每行含原因、整分钟半开生效区间与非负每分钟金额，同版本同原因区间不重叠），"
+        "POST /devices/{device_id}/rate-versions 按设备原子发布费率版本或复用同内容版本"
+        "（每行含原因、整分钟半开生效区间与非负每分钟金额，同版本同原因区间不重叠；"
+        "等价时区、行换序、相同金额写法不产生重复版本），"
         "POST /shifts/{shift_id}/loss-accountings 对已结算班次指定修订与费率版本"
         "核算停机损失：以修订固化归因段按费率边界切分，定点数逐段四舍五入到分后"
         "汇总，未匹配费率的分钟单列待定价（不作零金额）；结果按"
@@ -768,28 +770,43 @@ def _rate_version_detail_out(rv, entries) -> RateVersionDetailOut:
     )
 
 
+def _rate_version_published_out(
+    rv, entries, idempotent: bool
+) -> RateVersionPublishedOut:
+    detail = _rate_version_detail_out(rv, entries)
+    return RateVersionPublishedOut(
+        **detail.model_dump(), idempotent=idempotent
+    )
+
+
 @app.post(
     "/devices/{device_id}/rate-versions",
-    response_model=RateVersionDetailOut,
+    response_model=RateVersionPublishedOut,
     status_code=201,
     tags=["loss-accounting"],
 )
 def publish_rate_version_route(
-    device_id: str, payload: RateVersionIn, db: Session = Depends(get_db)
+    device_id: str,
+    payload: RateVersionIn,
+    response: Response,
+    db: Session = Depends(get_db),
 ):
-    """为设备原子发布一个递增费率版本（完整费率表）。
+    """为设备发布完整费率版本，或幂等复用同内容的已发布版本。
 
     - 每行含原因、带时区的整分钟半开生效区间 [start, end) 与非负每分钟金额
       （十进制字符串，元，最多 6 位小数）；同版本**同原因**区间不得重叠
       （端点相接允许），不同原因可重叠；费率表不能为空；
     - 版本号设备内连续递增（服务端分配）：并发发布在设备行锁内串行，
-      版本连续无缺口；版本与其全部费率行**同事务原子提交**，不存在发布一半；
+      版本连续无缺口；同费率表（时间等价、行顺序无关、金额数值相同）重试
+      复用原版本（200，idempotent=true），不同费率表才追加新版本（201）；
+    - 版本与其全部费率行**同事务原子提交**，不存在发布一半；
     - 已发布版本不可变；之后的发布只产生新版本（历史核算账引用的内容永不变）；
     - 未知设备 404 DEVICE_NOT_FOUND；金额/原因/区间非法、空表或同原因重叠
       → 422 RATE_ENTRY_INVALID（整批拒绝，不留下任何版本或费率行）。
     """
-    rv, entries = services.publish_rate_version(db, device_id, payload)
-    return _rate_version_detail_out(rv, entries)
+    rv, entries, idempotent = services.publish_rate_version(db, device_id, payload)
+    response.status_code = 200 if idempotent else 201
+    return _rate_version_published_out(rv, entries, idempotent)
 
 
 @app.get(

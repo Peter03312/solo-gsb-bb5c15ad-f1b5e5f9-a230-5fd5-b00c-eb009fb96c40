@@ -208,6 +208,99 @@ def test_publish_rate_version_unknown_device_404(client):
     assert r.json()["detail"]["code"] == "DEVICE_NOT_FOUND"
 
 
+def test_publish_rate_version_idempotent_for_equivalent_table(client):
+    client.post("/devices", json=DEVICE)
+    first = _publish(
+        client,
+        [
+            _entry("failure", "10:00:00", "11:00:00", "10"),
+            _entry("maintenance", "00:00:00", "12:00:00", "5.000000"),
+        ],
+        note="首次发布说明",
+    ).json()
+    assert first["version"] == 1
+    assert first["idempotent"] is False
+
+    # 等价 UTC 表示、列表换序、金额等价写法；note 改变/省略不影响计价内容。
+    r = client.post(
+        "/devices/CNC-01/rate-versions",
+        json={
+            "note": "重试不应生成新版本",
+            "entries": [
+                {
+                    "reason": "maintenance",
+                    "start": "2026-09-30T16:00:00Z",
+                    "end": "2026-10-01T04:00:00Z",
+                    "amount_per_minute": "5",
+                },
+                {
+                    "reason": "failure",
+                    "start": "2026-10-01T02:00:00+00:00",
+                    "end": "2026-10-01T03:00:00+00:00",
+                    "amount_per_minute": "10.0",
+                },
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    again = r.json()
+    assert again["idempotent"] is True
+    assert again["version"] == 1
+    assert again["created_at"] == first["created_at"]
+    assert [(e["entry_no"], e["amount_per_minute"]) for e in again["entries"]] == [
+        (1, "5"),
+        (2, "10"),
+    ]
+    assert [v["version"] for v in client.get("/devices/CNC-01/rate-versions").json()] == [1]
+
+
+def test_publish_different_rate_table_appends_version(client):
+    client.post("/devices", json=DEVICE)
+    first = _publish(client, [_entry("failure", "00:00:00", "23:59:00", "1")]).json()
+    second = _publish(client, [_entry("failure", "00:00:00", "23:59:00", "2")]).json()
+    assert first["version"] == 1 and second["version"] == 2
+    assert second["idempotent"] is False
+    assert [v["version"] for v in client.get("/devices/CNC-01/rate-versions").json()] == [2, 1]
+
+
+def test_same_rate_table_can_exist_on_different_devices(client):
+    client.post("/devices", json=DEVICE)
+    client.post("/devices", json={"id": "CNC-02", "name": "二号机"})
+    table = [_entry("failure", "00:00:00", "23:59:00", "1")]
+    r1 = _publish(client, table, device="CNC-01")
+    r2 = _publish(client, table, device="CNC-02")
+    assert r1.json()["version"] == r2.json()["version"] == 1
+    assert r2.json()["idempotent"] is False
+
+
+def test_publish_concurrent_identical_table_returns_single_version(client):
+    client.post("/devices", json=DEVICE)
+    barrier = threading.Barrier(4)
+    results: list[tuple[int, int]] = []
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            r = client.post(
+                "/devices/CNC-01/rate-versions",
+                json={"entries": [_entry("failure", "00:00:00", "23:59:00", "1")]},
+            )
+            assert r.status_code in (200, 201), r.text
+            results.append((r.status_code, r.json()["version"]))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert sorted(results) == sorted([(200, 1), (200, 1), (200, 1), (201, 1)])
+    assert [v["version"] for v in client.get("/devices/CNC-01/rate-versions").json()] == [1]
+
+
 def test_get_unknown_rate_version_404(client):
     client.post("/devices", json=DEVICE)
     r = client.get("/devices/CNC-01/rate-versions/99")
@@ -220,18 +313,18 @@ def test_concurrent_publishes_get_contiguous_versions(client):
     barrier = threading.Barrier(4)
     errors: list[Exception] = []
 
-    def worker():
+    def worker(idx: int):
         try:
             barrier.wait(timeout=10)
             r = client.post(
                 "/devices/CNC-01/rate-versions",
-                json={"entries": [_entry("failure", "00:00:00", "23:59:00", "1")]},
+                json={"entries": [_entry("failure", "00:00:00", "23:59:00", str(idx + 1))]},
             )
             assert r.status_code == 201, r.text
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(4)]
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
     for t in threads:
         t.start()
     for t in threads:

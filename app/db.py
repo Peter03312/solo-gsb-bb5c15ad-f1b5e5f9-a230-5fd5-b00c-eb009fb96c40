@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 
@@ -53,6 +55,7 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     _migrate_adjudications()
     _migrate_segments()
     _create_rate_entries_exclusion_constraint()
+    _migrate_rate_content_hashes()
     _create_maintenance_plans_exclusion_constraint()
 
 
@@ -88,6 +91,108 @@ def _create_maintenance_plans_exclusion_constraint() -> None:
             "btree_gist 不可用，未创建保养计划期间排他约束（应用层重叠校验仍生效）：%s",
             exc,
         )
+
+
+def _migrate_rate_content_hashes() -> None:
+    """为既有费率版本补齐规范化内容哈希与同设备唯一约束（幂等迁移）。
+
+    新库由 create_all 直接得到非空 content_hash 和唯一约束。既有库先补列，再按
+    已固化、不可变的 rate_entries 回填；若旧版本中已有相同费率表（新幂等规则启用
+    前的重复发布），保留最早版本为可重试命中对象，较晚历史版本在哈希后追加版本
+    消歧后缀，从而不合并、不删除任何不可变版本；最后加 NOT NULL/唯一约束。
+    """
+    with engine.begin() as conn:
+        seen_hashes: dict[tuple[str, str], int] = {}
+        conn.execute(
+            text("ALTER TABLE rate_versions ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)")
+        )
+        rows = conn.execute(
+            text(
+                """
+                SELECT v.device_id, v.version
+                FROM rate_versions v
+                WHERE v.content_hash IS NULL
+                ORDER BY v.device_id, v.version
+                """
+            )
+        ).all()
+        for device_id, version in rows:
+            entries = conn.execute(
+                text(
+                    """
+                    SELECT start_ts, end_ts, reason, amount_per_minute
+                    FROM rate_entries
+                    WHERE device_id = :device_id AND version = :version
+                    ORDER BY start_ts, reason, end_ts, amount_per_minute, id
+                    """
+                ),
+                {"device_id": device_id, "version": version},
+            ).all()
+            canonical = [
+                {
+                    "start": start_ts.isoformat(),
+                    "end": end_ts.isoformat(),
+                    "reason": reason,
+                    "amount_micro": int(amount),
+                }
+                for start_ts, end_ts, reason, amount in entries
+            ]
+            raw = json.dumps(
+                {"entries": canonical},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            base_hash = hashlib.sha256(raw).hexdigest()
+            seen_key = (device_id, base_hash)
+            duplicate_index = seen_hashes.get(seen_key, 0)
+            if duplicate_index:
+                # 仅给旧库重复版本消歧；截断旧哈希以满足 String(64)。
+                suffix = f"#history-v{version}-{duplicate_index}"
+                content_hash = base_hash[: max(0, 64 - len(suffix))] + suffix
+            else:
+                content_hash = base_hash
+            seen_hashes[seen_key] = duplicate_index + 1
+            conn.execute(
+                text(
+                    "UPDATE rate_versions SET content_hash = :content_hash "
+                    "WHERE device_id = :device_id AND version = :version"
+                ),
+                {
+                    "content_hash": content_hash,
+                    "device_id": device_id,
+                    "version": version,
+                },
+            )
+        conn.execute(
+            text("ALTER TABLE rate_versions ALTER COLUMN content_hash SET NOT NULL")
+        )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_version_content_hash "
+                "ON rate_versions (device_id, content_hash)"
+            )
+        )
+        # 兼容显式表级唯一约束命名（create_all 创建的是约束而非同名索引）。
+        exists = conn.execute(
+            text(
+                """
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'uq_rate_version_content_hash'
+                  AND conrelid = 'rate_versions'::regclass
+                """
+            )
+        ).scalar_one_or_none()
+        if exists is None:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE rate_versions
+                    ADD CONSTRAINT uq_rate_version_content_hash
+                    UNIQUE USING INDEX uq_rate_version_content_hash
+                    """
+                )
+            )
 
 
 def _create_rate_entries_exclusion_constraint() -> None:

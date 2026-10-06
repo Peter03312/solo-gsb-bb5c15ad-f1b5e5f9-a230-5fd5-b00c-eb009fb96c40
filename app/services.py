@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import attribution, pricing, reconciliation, allocation, closing, maintenance
+from . import fingerprints as fp
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -56,12 +57,7 @@ class ApiError(HTTPException):
 
 
 def _utc(dt: datetime) -> datetime:
-    return dt.astimezone(timezone.utc)
-
-
-def _content_hash(start: datetime, end: datetime, reason: str) -> str:
-    raw = f"{start.isoformat()}|{end.isoformat()}|{reason}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return fp.utc(dt)
 
 
 def get_device_or_404(db: Session, device_id: str) -> Device:
@@ -326,7 +322,7 @@ def ingest_event(
     """
     get_device_or_404(db, payload.device_id)
     start, end = _utc(payload.start), _utc(payload.end)
-    digest = _content_hash(start, end, payload.reason)
+    digest = fp.event_fingerprint(start, end, payload.reason)
 
     # 确保版本链游标存在并加行锁，串行化同一来源的并发上报
     db.execute(
@@ -449,7 +445,7 @@ def ingest_event_batch(
     acks: list[dict] = []
     for item in payload.events:
         start, end = _utc(item.start), _utc(item.end)
-        digest = _content_hash(start, end, item.reason)
+        digest = fp.event_fingerprint(start, end, item.reason)
         exp = expected[item.source_id]
         if item.version <= exp:
             # 已存在（库中或本批已接受）的同版本：同内容可重试，异内容整批失败
@@ -761,7 +757,7 @@ def preview_event(db: Session, payload: EventIn) -> tuple[bool, list[dict], str]
     """
     get_device_or_404(db, payload.device_id)
     start, end = _utc(payload.start), _utc(payload.end)
-    digest = _content_hash(start, end, payload.reason)
+    digest = fp.event_fingerprint(start, end, payload.reason)
 
     # 只读：不补建来源行、不加锁；状态竞争由确认时的逐项复核兜底
     src = db.execute(
@@ -890,7 +886,7 @@ def confirm_event(
     device_id = state["device_id"]
     get_device_or_404(db, device_id)
     start, end = state["start"], state["end"]
-    digest = _content_hash(start, end, state["reason"])
+    digest = fp.event_fingerprint(start, end, state["reason"])
 
     # 与单条上报共用同一版本链行锁，串行化并发上报/确认
     db.execute(
@@ -985,11 +981,6 @@ def confirm_event(
 # ---------------------------------------------------------------- 现场人工裁定
 
 
-def _ruling_hash(start: datetime, end: datetime, reason: str, note: str) -> str:
-    raw = f"{start.isoformat()}|{end.isoformat()}|{reason}|{note}"
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
 def _get_locked_settled_shift(db: Session, shift_id: int) -> Shift:
     """取出班次行（FOR UPDATE 串行化该班次的所有写操作）并要求已结算。"""
     shift = db.execute(
@@ -1045,7 +1036,7 @@ def submit_adjudication(
             f"shift [{shift.start_ts.isoformat()}, {shift.end_ts.isoformat()})",
         )
     note = payload.note or ""
-    digest = _ruling_hash(start, end, payload.reason, note)
+    digest = fp.ruling_fingerprint(start, end, payload.reason, note)
 
     existing = db.execute(
         select(ManualAdjudication).where(
@@ -1571,14 +1562,17 @@ def get_shift_snapshot(
 
 def publish_rate_version(
     db: Session, device_id: str, payload
-) -> tuple[RateVersion, list[RateEntry]]:
-    """为设备发布一个完整费率版本（整批原子，版本号设备内连续递增）。
+) -> tuple[RateVersion, list[RateEntry], bool]:
+    """为设备发布完整费率版本，或复用同内容的已发布版本。
 
-    - 锁定设备行分配下一版本号：并发发布相互串行，版本连续无缺口；
+    返回 (版本行, 费率行[按 entry_no], 是否幂等命中)。
+
+    - 锁定设备行：并发发布串行，新版本号连续无缺口；同内容重试只返回原版本；
     - 金额解析、逐行区间与同原因重叠校验全部在事务内完成，任一非法整批
       失败（不留下版本与任何费率行）；版本与其全部行同事务提交；
-    - 发布后不可变：之后的发布只追加新版本。
-    返回 (版本行, 费率行[按 entry_no])。
+    - 业务指纹只包含费率行（UTC 时间、原因、整数微元金额），请求列表顺序和
+      等价十进制写法（"1" / "1.000000"）不影响指纹；note 不参与计价故不含；
+    - 发布后不可变：不同费率内容之后的发布只追加新版本。
     """
     # 设备行锁：版本号在锁内按 max(version)+1 分配，串行化该设备的并发发布
     device = db.execute(
@@ -1606,11 +1600,41 @@ def publish_rate_version(
     except pricing.RateTableError as exc:
         raise ApiError(422, "RATE_ENTRY_INVALID", str(exc))
 
+    content_hash = fp.rate_table_fingerprint(
+        [(ln.start, ln.end, ln.reason, ln.amount_per_minute) for ln in lines]
+    )
+    existing = db.execute(
+        select(RateVersion)
+        .where(
+            RateVersion.device_id == device_id,
+            RateVersion.content_hash == content_hash,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if existing is not None:
+        entries = list(
+            db.execute(
+                select(RateEntry)
+                .where(
+                    RateEntry.device_id == device_id,
+                    RateEntry.version == existing.version,
+                )
+                .order_by(RateEntry.entry_no)
+            )
+            .scalars()
+            .all()
+        )
+        db.commit()
+        return existing, entries, True
+
     last_version = db.execute(
         select(func.max(RateVersion.version)).where(RateVersion.device_id == device_id)
     ).scalar() or 0
     version = RateVersion(
-        device_id=device_id, version=last_version + 1, note=payload.note or ""
+        device_id=device_id,
+        version=last_version + 1,
+        content_hash=content_hash,
+        note=payload.note or "",
     )
     db.add(version)
     db.flush()  # 会话 autoflush=False：先落版本行，费率行复合外键才可见
@@ -1632,15 +1656,36 @@ def publish_rate_version(
         entries.append(entry)
     try:
         db.commit()
-    except IntegrityError:  # 排他约束等兜底（理论上应用层校验已覆盖）
+    except IntegrityError:
         db.rollback()
+        winner = db.execute(
+            select(RateVersion).where(
+                RateVersion.device_id == device_id,
+                RateVersion.content_hash == content_hash,
+            )
+        ).scalar_one_or_none()
+        if winner is not None:
+            entries = list(
+                db.execute(
+                    select(RateEntry)
+                    .where(
+                        RateEntry.device_id == device_id,
+                        RateEntry.version == winner.version,
+                    )
+                    .order_by(RateEntry.entry_no)
+                )
+                .scalars()
+                .all()
+            )
+            return winner, entries, True
+        # 排他约束等兜底（应用层校验已覆盖）
         raise ApiError(
             422,
             "RATE_ENTRY_INVALID",
             "rate table rejected: overlapping or illegal rate entries",
         )
     db.refresh(version)
-    return version, entries
+    return version, entries, False
 
 
 def get_rate_version(
@@ -1961,24 +2006,8 @@ def list_loss_accountings(
 def _allocation_content_hash(
     accounting_ids: list[int], batches: list[tuple[str, datetime, datetime]]
 ) -> str:
-    """规范化提交内容 → sha256（与列表顺序无关）。
-
-    账 id 去重升序；批次按批次号升序，窗口端点归一为 UTC 整分钟 ISO 串。
-    """
-    canonical_accounts = sorted(set(accounting_ids))
-    canonical_batches = sorted(
-        ((bno, _utc(s), _utc(e)) for bno, s, e in batches),
-        key=lambda b: b[0],
-    )
-    payload = {
-        "accounting_ids": canonical_accounts,
-        "batches": [
-            {"batch_no": bno, "start": s.isoformat(), "end": e.isoformat()}
-            for bno, s, e in canonical_batches
-        ],
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
+    """规范化提交内容 → sha256（与列表顺序无关）。"""
+    return fp.allocation_fingerprint(accounting_ids, batches)
 
 
 def allocate_loss_costs(db: Session, payload) -> tuple[
@@ -2279,15 +2308,7 @@ def _closing_content_hash(
     rate_version: int,
 ) -> str:
     """规范化结账输入 → sha256（时间归一 UTC 整分钟 ISO 串）。"""
-    payload = {
-        "device_id": device_id,
-        "start": _utc(start).isoformat(),
-        "end": _utc(end).isoformat(),
-        "seq": int(seq),
-        "rate_version": int(rate_version),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return fp.closing_fingerprint(device_id, start, end, seq, rate_version)
 
 
 def _closing_items(
@@ -2615,20 +2636,7 @@ def _maintenance_plan_hash(
     windows: list[tuple[datetime, datetime]],
 ) -> str:
     """规范化计划内容 → sha256（时间归一 UTC 整分钟 ISO 串，窗口顺序无关）。"""
-    canonical_windows = sorted(
-        ((_utc(s), _utc(e)) for s, e in windows),
-        key=lambda w: (w[0], w[1]),
-    )
-    payload = {
-        "device_id": device_id,
-        "start": _utc(start).isoformat(),
-        "end": _utc(end).isoformat(),
-        "windows": [
-            {"start": s.isoformat(), "end": e.isoformat()} for s, e in canonical_windows
-        ],
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return fp.maintenance_plan_fingerprint(device_id, start, end, windows)
 
 
 def submit_maintenance_plan(

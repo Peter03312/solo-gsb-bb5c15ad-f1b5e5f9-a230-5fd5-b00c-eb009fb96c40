@@ -460,6 +460,12 @@ class RateVersionDetailOut(RateVersionOut):
     entries: list[RateEntryOut]
 
 
+class RateVersionPublishedOut(RateVersionDetailOut):
+    """发布/重试费率版本的响应：标明本次是否命中原版本。"""
+
+    idempotent: bool
+
+
 # ---------------------------------------------------------------- 停机损失核算
 
 

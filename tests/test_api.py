@@ -148,6 +148,22 @@ def test_event_version_chain(client):
     assert r.json()["idempotent"] is False
 
 
+def test_event_timezone_equivalent_retry_is_idempotent(client):
+    _make_shift(client)
+    r = client.post("/events", json=E_MAINT)
+    assert r.status_code == 201
+    retry = client.post(
+        "/events",
+        json={
+            **E_MAINT,
+            "start": "2026-10-01T02:00:00Z",
+            "end": "2026-10-01T03:00:00+00:00",
+        },
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["idempotent"] is True
+
+
 # ---------------------------------------------------------------- 结算 / 更正 / 修订
 
 

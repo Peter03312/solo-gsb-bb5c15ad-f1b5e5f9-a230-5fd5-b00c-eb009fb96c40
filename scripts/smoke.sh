@@ -222,6 +222,12 @@ echo "-- 费率版本列表与读取 --"
 req GET /devices/CNC-01/rate-versions
 req GET /devices/CNC-01/rate-versions/1
 
+echo "-- 同设备相同费率表重试（等价 UTC、行换序、金额写法等价、note 省略）：预期 200 仍返回 version=1 --"
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"pending","start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z","amount_per_minute":"0.000000"},
+  {"reason":"maintenance","start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z","amount_per_minute":"2.0"},
+  {"reason":"failure","start":"2026-09-30T16:00:00Z","end":"2026-10-01T16:00:00Z","amount_per_minute":"1.0"}]}'
+
 echo "-- 非法费率表（同原因区间重叠 / 负金额 / 空表）：预期 422 RATE_ENTRY_INVALID（整批不留痕）--"
 req POST /devices/CNC-01/rate-versions '{"entries":[
   {"reason":"failure","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","amount_per_minute":"1"},

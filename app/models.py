@@ -235,9 +235,11 @@ class ManualAdjudication(Base):
 class RateVersion(Base):
     """按设备发布的停机损失费率版本（版本号设备内连续递增，发布原子）。
 
-    - 版本号在发布事务内锁定设备行后分配（1 起连续），版本与其全部费率行
+    - 版本号在发布事务内锁定设备行后分配（1 起连续），版本与全部费率行
       同一事务提交/回滚：其他事务只能读到完整发布的版本，读不到半成品；
-    - 发布后不可变（只追加、不更新不删除）：后续费率发布只产生新版本，
+    - content_hash 只包含完整费率表的计价业务内容（UTC 时间、原因、整数微元
+      金额；请求行顺序无关、note 不参与），同设备同内容重试复用同一版本；
+    - 发布后不可变（只追加、不更新不删除）：不同费率内容只产生新版本，
       历史核算结果引用的版本内容永远不变。
     """
 
@@ -248,6 +250,9 @@ class RateVersion(Base):
         ForeignKey("devices.id"), nullable=False, index=True
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 完整费率表的业务内容指纹（不包含 note；时间 UTC、行集合换序、金额写法归一）。
+    # 同设备同内容重试复用同一版本；跨设备允许相同费率表。
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -255,6 +260,9 @@ class RateVersion(Base):
 
     __table_args__ = (
         UniqueConstraint("device_id", "version", name="uq_rate_version"),
+        UniqueConstraint(
+            "device_id", "content_hash", name="uq_rate_version_content_hash"
+        ),
     )
 
 
